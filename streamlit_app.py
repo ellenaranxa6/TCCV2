@@ -274,16 +274,13 @@ def build_figure(
         )
     )
 
-    fig.update_layout(
-        height=650,
+    selectedpoints=[],
         showlegend=True,
         margin=dict(l=10, r=10, t=10, b=10),
         clickmode="event+select",
     )
 
     return fig
-
-
 # =========================================================
 # SELEÇÃO DO VÃO (CLIQUE + SIDEBAR)
 # =========================================================
