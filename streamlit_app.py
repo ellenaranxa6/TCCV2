@@ -1,339 +1,446 @@
+import sqlite3
+import ast
+from typing import Dict, Tuple, List, Optional
+
 import streamlit as st
+import pandas as pd
 import plotly.graph_objects as go
 import networkx as nx
-import opendssdirect as dss
-import pandas as pd
-import sqlite3
-import os
-import re
+from streamlit_plotly_events import plotly_events
 
 # =========================================================
-# CONFIGURAÇÃO STREAMLIT
+# CONFIGURAÇÃO GERAL
 # =========================================================
-st.set_page_config(page_title="Isolamento IEEE-123", layout="wide")
-st.title("⚡ Plataforma Interativa – Isolamento Real IEEE-123")
+st.set_page_config(page_title="Isolamento Real IEEE 123 Bus", layout="wide")
 
-st.sidebar.header("⚙️ Configuração / Seleção")
+st.sidebar.header("📂 Dados carregados")
+
+DB_PATH = "ieee123_isolamento.db"   # banco na raiz do repo
+
+# ---------------------------------------------------------
+# FUNÇÕES DE ACESSO AO BANCO
+# ---------------------------------------------------------
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+
+def table_exists(conn, name: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    )
+    return cur.fetchone() is not None
+
+
+def load_coords(conn) -> Dict[str, Tuple[float, float]]:
+    cur = conn.cursor()
+    cur.execute("SELECT bus, x, y FROM coords")
+    return {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+
+
+def load_topology(conn) -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT line, from_bus, to_bus, is_switch, norm FROM topology",
+        conn,
+    )
+
+
+def load_vao_map(conn) -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT u_bus, v_bus, nf, kw, n_barras FROM vao_map",
+        conn,
+    )
+
 
 # =========================================================
-# CAMINHOS (RELATIVOS AO REPO NO STREAMLIT)
+# CARREGAMENTO DOS DADOS
 # =========================================================
-BASE_123BUS = "123Bus/"
-MASTER = os.path.join(BASE_123BUS, "IEEE123Master.dss")
-COORDS = os.path.join(BASE_123BUS, "BusCoords.dat")
-DB_PATH = "ieee123_isolamento.db"   # banco gerado no Colab
+try:
+    conn = get_connection()
+except Exception as e:
+    st.error(f"❌ Erro ao abrir o banco {DB_PATH}: {e}")
+    st.stop()
 
-TABELA_ISOLAMENTOS = "isolamentos"  # ajuste se o nome for diferente
+with conn:
+    has_coords = table_exists(conn, "coords")
+    has_topology = table_exists(conn, "topology")
+    has_vao_map = table_exists(conn, "vao_map")
+
+    st.sidebar.write("**Banco:** ", f"`{DB_PATH}`")
+
+    st.sidebar.write(
+        "MASTER:",
+        "✅" if has_topology else "❌",
+    )
+    st.sidebar.write(
+        "COORDS:",
+        "✅" if has_coords else "❌",
+    )
+    st.sidebar.write(
+        "VAO_MAP:",
+        "✅" if has_vao_map else "❌",
+    )
+
+    if not (has_coords and has_topology and has_vao_map):
+        st.error(
+            "Banco não possui alguma tabela necessária (`coords`, `topology`, `vao_map`)."
+        )
+        st.stop()
+
+    coords = load_coords(conn)
+    topo_df = load_topology(conn)
+    vao_df = load_vao_map(conn)
 
 # =========================================================
-# FUNÇÕES DE SUPORTE – DSS / TOPOLOGIA
+# EXPLICAÇÃO INICIAL
 # =========================================================
-def normalize(bus: str) -> str:
-    return bus.split(".")[0] if bus else ""
+st.title("⚡ Plataforma Interativa – Isolamento Real IEEE 123 Bus")
 
-@st.cache_resource
-def init_dss():
+with st.expander("ℹ️ Sobre esta ferramenta", expanded=True):
+    st.markdown(
+        """
+Ferramenta de apoio à manobra de **desligamento programado** em redes de distribuição,
+baseada no alimentador teste **IEEE-123 Bus**.
+
+A inteligência de isolamento (carga interrompida por NF e por vão U-V) foi calculada
+anteriormente no **OpenDSS + Python (Colab)** e os resultados foram gravados no banco
+SQLite `ieee123_isolamento.db`.
+
+Este aplicativo usa **apenas** o banco + coordenadas de barras para exibir:
+
+- ✅ Melhor chave **NF** de manobra para cada vão U-V  
+- ⚡ Carga interrompida e número de barras isoladas  
+- 🗺️ Mapa colorido da rede com destaque do vão e da NF  
+- 🧾 “Linha do tempo” da manobra
+"""
+    )
+
+# =========================================================
+# CONSTRUÇÃO DO GRAFO
+# =========================================================
+G = nx.Graph()
+for _, row in topo_df.iterrows():
+    u = str(row["from_bus"])
+    v = str(row["to_bus"])
+    G.add_edge(
+        u,
+        v,
+        line=str(row["line"]),
+        is_switch=bool(row["is_switch"]),
+        norm=str(row["norm"] or ""),
+    )
+
+all_buses = sorted(set(G.nodes()) & set(coords.keys()))
+
+# =========================================================
+# FUNÇÕES DE PLOT
+# =========================================================
+def build_figure(
+    G: nx.Graph,
+    coords: Dict[str, Tuple[float, float]],
+    vao: Optional[Tuple[str, str]] = None,
+    best_nf: Optional[str] = None,
+) -> go.Figure:
     """
-    Compila o modelo IEEE-123 no OpenDSSDirect apenas para:
-    - construir o grafo
-    - obter as barras de cada linha/chave
+    Cria o gráfico do alimentador:
+      - linhas normais: cinza
+      - chaves NF: azul turquesa
+      - NF de manobra escolhida: vermelho
+      - vão U-V: laranja
     """
-    if not os.path.exists(MASTER):
-        raise FileNotFoundError(f"Arquivo MASTER não encontrado: {MASTER}")
-    dss.Text.Command(f'compile "{MASTER}"')
-    dss.Solution.Solve()
-    return True
+    # Categorias de arestas
+    line_x, line_y = [], []
+    nf_x, nf_y = [], []
+    best_x, best_y = [], []
+    vao_x, vao_y = [], []
 
-def load_coordinates():
-    coords = {}
-    if not os.path.exists(COORDS):
-        st.sidebar.error(f"❌ Arquivo de coordenadas não encontrado: {COORDS}")
-        return coords
-    with open(COORDS, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            p = line.split()
-            if len(p) >= 3:
-                try:
-                    bus = p[0]
-                    x = float(p[1])
-                    y = float(p[2])
-                    coords[bus] = (x, y)
-                except Exception:
-                    pass
-    return coords
+    vao_set = set(vao) if vao and vao[0] and vao[1] else set()
 
-def build_graph_and_topology():
-    """
-    Monta:
-      - grafo G com todas as linhas fechadas (estado nominal)
-      - dict line2buses[name.lower()] = (bus1, bus2)
-    """
-    init_dss()
+    # descobrir a aresta do vão, se existir
+    vao_edge = None
+    if vao_set:
+        u, v = vao
+        for a, b, data in G.edges(data=True):
+            if {a, b} == {u, v}:
+                vao_edge = (a, b)
+                break
 
-    G = nx.Graph()
-    line2buses = {}
+    for u, v, data in G.edges(data=True):
+        if u not in coords or v not in coords:
+            continue
+        x0, y0 = coords[u]
+        x1, y1 = coords[v]
 
-    for name in dss.Lines.AllNames():
-        dss.Lines.Name(name)
-        b1 = normalize(dss.Lines.Bus1())
-        b2 = normalize(dss.Lines.Bus2())
-        is_sw = name.lower().startswith("sw")
+        if data.get("is_switch"):
+            if best_nf and str(data.get("line")).lower() == best_nf.lower():
+                best_x += [x0, x1, None]
+                best_y += [y0, y1, None]
+            else:
+                nf_x += [x0, x1, None]
+                nf_y += [y0, y1, None]
+        else:
+            line_x += [x0, x1, None]
+            line_y += [y0, y1, None]
 
-        # estado nominal: NFs fechadas, NAs abertas (sw7, sw8)
-        closed = True
-        if is_sw and name.lower() in ("sw7", "sw8"):
-            closed = False
+    # aresta do vão
+    if vao_edge:
+        u, v = vao_edge
+        x0, y0 = coords[u]
+        x1, y1 = coords[v]
+        vao_x += [x0, x1, None]
+        vao_y += [y0, y1, None]
 
-        line2buses[name.lower()] = (b1, b2)
+    # nós
+    node_x, node_y, node_text, node_color = [], [], [], []
+    for n in G.nodes():
+        if n not in coords:
+            continue
+        x, y = coords[n]
+        node_x.append(x)
+        node_y.append(y)
+        node_text.append(n)
 
-        if closed:
-            G.add_edge(b1, b2, element=name, is_switch=is_sw)
+        if vao_set and n in vao_set:
+            node_color.append("#FFA500")  # laranja – barras do vão
+        else:
+            node_color.append("#1f77b4")  # azul – barra normal
 
-    return G, line2buses
+    fig = go.Figure()
 
-# =========================================================
-# FUNÇÕES DE SUPORTE – BANCO DE DADOS
-# =========================================================
-@st.cache_data
-def load_db():
-    """
-    Carrega a tabela de isolamentos do banco sqlite.
-    Espera colunas: linha, sw_nf, kw, n_barras, (opcional barras_isoladas)
-    """
-    if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Banco de dados não encontrado: {DB_PATH}")
-
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        df = pd.read_sql_query(f"SELECT * FROM {TABELA_ISOLAMENTOS}", conn)
-    finally:
-        conn.close()
-
-    # Normaliza nomes de colunas em minúsculo
-    df.columns = [c.lower() for c in df.columns]
-
-    esperadas = {"linha", "sw_nf", "kw", "n_barras"}
-    faltando = esperadas - set(df.columns)
-    if faltando:
-        raise RuntimeError(
-            f"Tabela '{TABELA_ISOLAMENTOS}' não tem as colunas esperadas: "
-            f"faltando: {faltando}. Colunas existentes: {list(df.columns)}"
+    # Linhas normais
+    if line_x:
+        fig.add_trace(
+            go.Scatter(
+                x=line_x,
+                y=line_y,
+                mode="lines",
+                line=dict(color="#BBBBBB", width=1),
+                hoverinfo="none",
+                name="Linhas",
+            )
         )
 
-    return df
+    # NF fechadas
+    if nf_x:
+        fig.add_trace(
+            go.Scatter(
+                x=nf_x,
+                y=nf_y,
+                mode="lines",
+                line=dict(color="#00CED1", width=2),
+                hoverinfo="none",
+                name="Chaves NF",
+            )
+        )
+
+    # NF de manobra
+    if best_x:
+        fig.add_trace(
+            go.Scatter(
+                x=best_x,
+                y=best_y,
+                mode="lines",
+                line=dict(color="#FF4500", width=3),
+                hoverinfo="none",
+                name="NF de manobra",
+            )
+        )
+
+    # Vão
+    if vao_x:
+        fig.add_trace(
+            go.Scatter(
+                x=vao_x,
+                y=vao_y,
+                mode="lines",
+                line=dict(color="#FFA500", width=3, dash="dot"),
+                hoverinfo="none",
+                name="Vão U-V",
+            )
+        )
+
+    # Nós
+    fig.add_trace(
+        go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode="markers+text",
+            text=node_text,
+            textposition="top center",
+            marker=dict(size=7, color=node_color),
+            hovertemplate="<b>Barra:</b> %{text}<extra></extra>",
+            name="Barras",
+        )
+    )
+
+    fig.update_layout(
+        height=650,
+        showlegend=True,
+        margin=dict(l=10, r=10, t=10, b=10),
+        clickmode="event+select",
+    )
+
+    return fig
+
 
 # =========================================================
-# CARREGAMENTO DE DADOS
+# SELEÇÃO DO VÃO (CLIQUE + SIDEBAR)
 # =========================================================
-# 1) Banco de dados
-db_ok = True
-try:
-    df_iso = load_db()
-except Exception as e:
-    db_ok = False
-    st.sidebar.error(f"Erro ao carregar banco: {e}")
+st.subheader("🗺️ Mapa Interativo da Rede")
 
-# 2) Modelo DSS + coordenadas
-topo_ok = True
-try:
-    G, line2buses = build_graph_and_topology()
-    coords = load_coordinates()
-    st.sidebar.success("Modelo IEEE-123 carregado para visualização ✔")
-except Exception as e:
-    topo_ok = False
-    st.sidebar.error(f"Erro ao carregar modelo/coords: {e}")
-    coords = {}
+if "bus_u" not in st.session_state:
+    st.session_state.bus_u = ""
+if "bus_v" not in st.session_state:
+    st.session_state.bus_v = ""
 
-# Se qualquer uma das partes falhou, não continua
-if not (db_ok and topo_ok):
-    st.stop()
-
-# =========================================================
-# SIDEBAR – SELEÇÃO DO VÃO (LINHA) E VISUALIZAÇÃO
-# =========================================================
-st.sidebar.markdown("### 🔧 Selecione o vão (linha DSS)")
-
-# lista de vãos (linhas) disponíveis no banco
-linhas_disponiveis = sorted(df_iso["linha"].unique())
-linha_sel = st.sidebar.selectbox(
-    "Linha / Vão para manutenção:",
-    options=linhas_disponiveis,
-    index=0 if linhas_disponiveis else None,
+# figura inicial (sem destaque)
+base_fig = build_figure(
+    G,
+    coords,
+    vao=(st.session_state.bus_u, st.session_state.bus_v)
+    if st.session_state.bus_u and st.session_state.bus_v
+    else None,
+    best_nf=None,
 )
 
-# filtra todas as NFs testadas para esse vão
-df_v = df_iso[df_iso["linha"] == linha_sel].copy()
+# captura de cliques (usando streamlit-plotly-events)
+events = plotly_events(
+    base_fig,
+    click_event=True,
+    hover_event=False,
+    select_event=False,
+    key="graph",
+)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### ℹ️ Info do banco")
-st.sidebar.write(f"Vãos cadastrados: **{len(linhas_disponiveis)}**")
-st.sidebar.write(f"Registros totais: **{len(df_iso)}**")
+# se o usuário clicou numa barra (scatter dos nós)
+if events:
+    ev = events[0]
+    bus_clicked = ev.get("text")
+    if bus_clicked:
+        # vamos preenchendo U e V em sequência
+        if not st.session_state.bus_u:
+            st.session_state.bus_u = bus_clicked
+        elif not st.session_state.bus_v:
+            st.session_state.bus_v = bus_clicked
+        else:
+            # se já tem U e V, reinicia a seleção com o novo clique
+            st.session_state.bus_u = bus_clicked
+            st.session_state.bus_v = ""
 
-# =========================================================
-# CÁLCULO DA NF ÓTIMA PARA O VÃO
-# =========================================================
-if df_v.empty:
-    st.error("Não há registros no banco para este vão.")
-    st.stop()
+st.sidebar.markdown("### 🔧 Selecione o vão")
 
-# ordena por menor kW e, em seguida, menor nº de barras isoladas
-df_v_sorted = df_v.sort_values(["kw", "n_barras"])
-melhor = df_v_sorted.iloc[0]
+bus_u = st.sidebar.selectbox(
+    "Barra U",
+    options=[""] + all_buses,
+    index=([""] + all_buses).index(st.session_state.bus_u)
+    if st.session_state.bus_u in all_buses
+    else 0,
+    key="bus_u_select",
+)
 
-nf_otima = melhor["sw_nf"]
-kw_otima = melhor["kw"]
-nb_otima = melhor["n_barras"]
+bus_v = st.sidebar.selectbox(
+    "Barra V",
+    options=[""] + all_buses,
+    index=([""] + all_buses).index(st.session_state.bus_v)
+    if st.session_state.bus_v in all_buses
+    else 0,
+    key="bus_v_select",
+)
 
-st.subheader(f"🔍 Vão selecionado: **{linha_sel}**")
-st.markdown(
-    f"""
-**NF de manobra ótima (pelo banco):** `{nf_otima}`  
-- ⚡ Potência interrompida: **{kw_otima:.1f} kW**  
-- 🔻 Barras isoladas: **{int(nb_otima)}**  
+# sincroniza estado
+if bus_u:
+    st.session_state.bus_u = bus_u
+if bus_v:
+    st.session_state.bus_v = bus_v
+
+vao_ok = bool(st.session_state.bus_u and st.session_state.bus_v)
+
+if vao_ok:
+    u = st.session_state.bus_u
+    v = st.session_state.bus_v
+
+    st.markdown(
+        f"#### 🔍 Vão selecionado: **{u} — {v}** (ordem não importa)"
+    )
+
+    # =====================================================
+    # CONSULTA DAS OPÇÕES DE NF PARA ESSE VÃO
+    # =====================================================
+    with conn:
+        df_vao = pd.read_sql_query(
+            """
+            SELECT u_bus, v_bus, nf, kw, n_barras
+            FROM vao_map
+            WHERE (u_bus = ? AND v_bus = ?)
+               OR (u_bus = ? AND v_bus = ?)
+            """,
+            conn,
+            params=(u, v, v, u),
+        )
+
+    if df_vao.empty:
+        st.error("Não há registros de manobra para esse par de barras no banco.")
+        best_nf = None
+    else:
+        # melhor NF: menor kW, depois menor nº de barras
+        df_vao_sorted = df_vao.sort_values(["kw", "n_barras"])
+        best_row = df_vao_sorted.iloc[0]
+        best_nf = best_row["nf"]
+
+        st.markdown("##### 🧮 Opções de NF para o vão")
+        st.dataframe(
+            df_vao_sorted.rename(
+                columns={
+                    "nf": "NF",
+                    "kw": "kW interrompidos",
+                    "n_barras": "Nº barras isoladas",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        # =================================================
+        # MAPA COM DESTAQUE DO VÃO E DA NF
+        # =================================================
+        fig_vao = build_figure(
+            G,
+            coords,
+            vao=(u, v),
+            best_nf=best_nf,
+        )
+        st.plotly_chart(fig_vao, use_container_width=True)
+
+        # =================================================
+        # LINHA DO TEMPO DA MANOBRA
+        # =================================================
+        st.markdown("### 📜 Linha do tempo da manobra")
+
+        st.markdown(
+            f"""
+1. **Identificação do vão de trabalho**  
+   - Trecho entre as barras **{u}** e **{v}**.
+
+2. **Análise prévia de desligamento (via banco de dados)**  
+   - Para este vão, foram avaliadas todas as chaves **NF** disponíveis.  
+   - A chave escolhida foi **{best_nf.upper()}**, por apresentar:  
+     - Menor potência interrompida (**{best_row['kw']:.1f} kW**)  
+     - Menor número de barras isoladas (**{int(best_row['n_barras'])} barras**).
+
+3. **Sequência de manobra recomendada**  
+   1. Confirmar condições de segurança e liberação do trecho {u}–{v}.  
+   2. **Abrir a chave {best_nf.upper()}** (NF de manobra).  
+   3. Verificar ausência de tensão no vão {u}–{v} e aplicar os procedimentos de bloqueio/etiquetagem.  
+   4. Executar a **manutenção programada** no trecho.  
+   5. Após conclusão, retirar bloqueios, inspecionar o trecho e **fechar novamente a chave {best_nf.upper()}**.  
+
+4. **Restabelecimento**  
+   - Normalização do esquema de manobra original do alimentador.  
+   - Atualizar registros operacionais (ordem de serviço, diário de manobras, etc.).
 """
-)
-
-# mostra tabela completa de opções para o vão
-st.markdown("### 📊 Opções de desligamento para este vão (do banco)")
-st.dataframe(
-    df_v_sorted[["sw_nf", "kw", "n_barras"]],
-    use_container_width=True,
-)
-
-# =========================================================
-# PLOT – TOPOLOGIA COLORIDA
-# =========================================================
-st.markdown("### 🗺️ Mapa da Rede com Vão e NF Destacados")
-
-# Buses do vão (linha) selecionado (se existir na topologia)
-linha_key = linha_sel.lower()
-vao_bus1, vao_bus2 = line2buses.get(linha_key, (None, None))
-
-# Buses da NF ótima
-nf_key = str(nf_otima).lower()
-nf_bus1, nf_bus2 = line2buses.get(nf_key, (None, None))
-
-# separa arestas por tipo de destaque
-edges_normal = []
-edges_vao = []
-edges_nf = []
-
-for u, v, data in G.edges(data=True):
-    elem = data.get("element", "")
-    elem_lower = str(elem).lower()
-
-    # categorização
-    if elem_lower == linha_key:
-        edges_vao.append((u, v))
-    elif elem_lower == nf_key:
-        edges_nf.append((u, v))
-    else:
-        edges_normal.append((u, v))
-
-# monta vetores para plotly
-def edge_segments(edge_list):
-    xs, ys = [], []
-    for u, v in edge_list:
-        if u in coords and v in coords:
-            x0, y0 = coords[u]
-            x1, y1 = coords[v]
-            xs += [x0, x1, None]
-            ys += [y0, y1, None]
-    return xs, ys
-
-edge_x_norm, edge_y_norm = edge_segments(edges_normal)
-edge_x_vao, edge_y_vao = edge_segments(edges_vao)
-edge_x_nf, edge_y_nf = edge_segments(edges_nf)
-
-# nós
-node_x, node_y, node_text, node_color = [], [], [], []
-
-for n in G.nodes():
-    if n not in coords:
-        continue
-    x, y = coords[n]
-    node_x.append(x)
-    node_y.append(y)
-    node_text.append(n)
-
-    # cores dos nós
-    if (n == vao_bus1) or (n == vao_bus2):
-        node_color.append("#FFA500")  # laranja – vão
-    elif (n == nf_bus1) or (n == nf_bus2):
-        node_color.append("#FF4500")  # vermelho NF
-    else:
-        node_color.append("#1f77b4")  # azul padrão
-
-fig = go.Figure()
-
-# linhas normais
-fig.add_trace(go.Scatter(
-    x=edge_x_norm, y=edge_y_norm,
-    mode="lines",
-    line=dict(color="#B0B0B0", width=1),
-    hoverinfo="none",
-    name="Linhas ativas"
-))
-
-# vão selecionado
-if edge_x_vao:
-    fig.add_trace(go.Scatter(
-        x=edge_x_vao, y=edge_y_vao,
-        mode="lines",
-        line=dict(color="#FFA500", width=3),
-        hoverinfo="none",
-        name=f"Vão {linha_sel}"
-    ))
-
-# NF ótima
-if edge_x_nf:
-    fig.add_trace(go.Scatter(
-        x=edge_x_nf, y=edge_y_nf,
-        mode="lines",
-        line=dict(color="#FF4500", width=3, dash="dash"),
-        hoverinfo="none",
-        name=f"NF ótima {nf_otima}"
-    ))
-
-# nós
-fig.add_trace(go.Scatter(
-    x=node_x, y=node_y,
-    mode="markers+text",
-    text=node_text,
-    textposition="top center",
-    marker=dict(size=7, color=node_color, line=dict(width=0.5, color="black")),
-    hovertemplate="<b>Barra:</b> %{text}<extra></extra>",
-    name="Barras"
-))
-
-fig.update_layout(
-    height=650,
-    showlegend=True,
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    margin=dict(l=0, r=0, t=40, b=0),
-    xaxis=dict(visible=False),
-    yaxis=dict(visible=False),
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# =========================================================
-# TIMELINE SIMPLES DA MANOBRA
-# =========================================================
-st.markdown("### ⏱️ Timeline da Manobra (conceitual)")
-
-timeline = [
-    "Estado inicial: todas as chaves NF fechadas, NAs abertas (sw7, sw8).",
-    f"Identificado vão **{linha_sel}** no banco e calculadas as combinações de desligamento.",
-    f"Selecionada NF ótima **{nf_otima}**, que isola as duas barras do vão com **mínimo kW interrompido ({kw_otima:.1f} kW)** "
-    f"e **{int(nb_otima)} barras isoladas**.",
-    f"Sequência sugerida:\n"
-    f"  1️⃣ Confirmar condições de segurança no vão {linha_sel} (entre barras {vao_bus1} e {vao_bus2}).\n"
-    f"  2️⃣ Abrir **{nf_otima}** (manobra de desligamento principal).\n"
-    f"  3️⃣ Verificar tensões nas barras a jusante e validar ausência de energia no vão.\n"
-    f"  4️⃣ Executar manutenção programada no vão {linha_sel}.\n"
-    f"  5️⃣ Após manutenção, recompor a configuração original (fechar {nf_otima} novamente, se aplicável)."
-]
-
-for step in timeline:
-    st.markdown(f"- {step}")
+        )
+else:
+    st.info(
+        "Selecione duas barras (U e V) pela barra lateral **ou clicando em duas barras no grafo** "
+        "para analisar o melhor desligamento."
+    )
