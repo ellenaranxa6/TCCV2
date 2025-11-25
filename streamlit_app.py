@@ -274,10 +274,10 @@ def build_figure(
         )
     )
 
-    selectedpoints=[],
-        showlegend=True,
-        margin=dict(l=10, r=10, t=10, b=10),
-        clickmode="event+select",
+        selectedpoints=[],
+            showlegend=True,
+            margin=dict(l=10, r=10, t=10, b=10),
+            clickmode="event+select",
     )
 
     return fig
