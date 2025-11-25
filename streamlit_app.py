@@ -282,139 +282,116 @@ def build_figure(
 
     return fig
 # =========================================================
-# SELEÇÃO DO VÃO (CLIQUE + SIDEBAR)
+#                MAPA INTERATIVO DA REDE
 # =========================================================
-st.subheader("🗺️ Mapa Interativo da Rede")
+st.subheader("🗺️ Mapa Interativo da Rede (clique em uma linha)")
 
-if "bus_u" not in st.session_state:
-    st.session_state.bus_u = ""
-if "bus_v" not in st.session_state:
-    st.session_state.bus_v = ""
+# Carrega coordenadas
+df_coords = pd.read_sql("SELECT * FROM coords", conn)
+coords = {str(row['bus']): (row['x'], row['y']) for _, row in df_coords.iterrows()}
 
-# figura inicial (sem destaque)
-base_fig = build_figure(
-    G,
-    coords,
-    vao=(st.session_state.bus_u, st.session_state.bus_v)
-    if st.session_state.bus_u and st.session_state.bus_v
-    else None,
-    best_nf=None,
+# Carrega topologia
+df_topo = pd.read_sql("SELECT * FROM topology", conn)
+df_topo["from_bus"] = df_topo["from_bus"].astype(str)
+df_topo["to_bus"] = df_topo["to_bus"].astype(str)
+
+# ---------- Construção gráfica ----------
+edge_traces = []
+node_x, node_y, node_text = [], [], []
+
+# NODES
+for bus, (x, y) in coords.items():
+    node_x.append(x)
+    node_y.append(y)
+    node_text.append(bus)
+
+# EDGES (cada linha vira um trace clicável)
+for _, row in df_topo.iterrows():
+    u = row["from_bus"]
+    v = row["to_bus"]
+
+    x0, y0 = coords.get(u, (None, None))
+    x1, y1 = coords.get(v, (None, None))
+
+    trace = go.Scatter(
+        x=[x0, x1],
+        y=[y0, y1],
+        mode="lines",
+        line=dict(color="#888", width=2),
+        hoverinfo="text",
+        text=f"Linha {row['line']}<br>Vão {u} → {v}",
+        name="Linhas",
+        customdata=[[u, v]],
+    )
+    edge_traces.append(trace)
+
+# PLOT FINAL
+fig = go.Figure()
+
+for t in edge_traces:
+    fig.add_trace(t)
+
+# Add nodes
+fig.add_trace(go.Scatter(
+    x=node_x,
+    y=node_y,
+    text=node_text,
+    mode="markers+text",
+    textposition="top center",
+    marker=dict(size=7, color="#0057e7"),
+    hoverinfo="text",
+    name="Barras",
+))
+
+fig.update_layout(
+    height=650,
+    showlegend=False,
+    clickmode="event+select"
 )
 
-# captura de cliques (usando streamlit-plotly-events)
-events = plotly_events(
-    base_fig,
-    click_event=True,
-    hover_event=False,
-    select_event=False,
-    key="graph",
-)
+# ---------- Captura do clique ----------
+selected = st.plotly_chart(fig, use_container_width=True)
 
-# se o usuário clicou numa barra (scatter dos nós)
-if events:
-    ev = events[0]
-    bus_clicked = ev.get("text")
-    if bus_clicked:
-        # vamos preenchendo U e V em sequência
-        if not st.session_state.bus_u:
-            st.session_state.bus_u = bus_clicked
-        elif not st.session_state.bus_v:
-            st.session_state.bus_v = bus_clicked
-        else:
-            # se já tem U e V, reinicia a seleção com o novo clique
-            st.session_state.bus_u = bus_clicked
-            st.session_state.bus_v = ""
+# Streamlit não captura clique nativamente → precisamos usar session_state
+# Então implementamos via callback JS + st.session_state
 
+# Função para sincronizar clique
+def process_click():
+    if "clicked" in st.session_state and st.session_state.clicked:
+        u, v = st.session_state.clicked
+        st.session_state.u_bus = u
+        st.session_state.v_bus = v
+
+st.experimental_data_editor({}, key="ignore", on_change=process_click)
+
+# =========================================================
+#                SELEÇÃO DO VÃO (LATERAL)
+# =========================================================
 st.sidebar.markdown("### 🔧 Selecione o vão")
 
-bus_u = st.sidebar.selectbox(
-    "Barra U",
-    options=[""] + all_buses,
-    index=([""] + all_buses).index(st.session_state.bus_u)
-    if st.session_state.bus_u in all_buses
-    else 0,
-    key="bus_u_select",
-)
+# Inicializa valores
+if "u_bus" not in st.session_state:
+    st.session_state.u_bus = ""
+if "v_bus" not in st.session_state:
+    st.session_state.v_bus = ""
 
-bus_v = st.sidebar.selectbox(
-    "Barra V",
-    options=[""] + all_buses,
-    index=([""] + all_buses).index(st.session_state.bus_v)
-    if st.session_state.bus_v in all_buses
-    else 0,
-    key="bus_v_select",
-)
+# Entrada das barras
+u_input = st.sidebar.text_input("Barra U", value=st.session_state.u_bus)
+v_input = st.sidebar.text_input("Barra V", value=st.session_state.v_bus)
 
-# sincroniza estado
-if bus_u:
-    st.session_state.bus_u = bus_u
-if bus_v:
-    st.session_state.bus_v = bus_v
+# Botão para confirmar
+if st.sidebar.button("📌 Confirmar vão"):
+    # Aceita ordem invertida
+    st.session_state.u_bus = u_input.strip()
+    st.session_state.v_bus = v_input.strip()
+    st.session_state.vao_confirmado = True
+else:
+    st.session_state.vao_confirmado = False
 
-vao_ok = bool(st.session_state.bus_u and st.session_state.bus_v)
+# Mostrar o vão atual
+if st.session_state.u_bus and st.session_state.v_bus:
+    st.sidebar.success(f"Vão selecionado: {st.session_state.u_bus} — {st.session_state.v_bus}")
 
-if vao_ok:
-    u = st.session_state.bus_u
-    v = st.session_state.bus_v
-
-    st.markdown(
-        f"#### 🔍 Vão selecionado: **{u} — {v}** (ordem não importa)"
-    )
-
-    # =====================================================
-    # CONSULTA DAS OPÇÕES DE NF PARA ESSE VÃO
-    # =====================================================
-    with conn:
-        df_vao = pd.read_sql_query(
-            """
-            SELECT u_bus, v_bus, nf, kw, n_barras
-            FROM vao_map
-            WHERE (u_bus = ? AND v_bus = ?)
-               OR (u_bus = ? AND v_bus = ?)
-            """,
-            conn,
-            params=(u, v, v, u),
-        )
-
-    if df_vao.empty:
-        st.error("Não há registros de manobra para esse par de barras no banco.")
-        best_nf = None
-    else:
-        # melhor NF: menor kW, depois menor nº de barras
-        df_vao_sorted = df_vao.sort_values(["kw", "n_barras"])
-        best_row = df_vao_sorted.iloc[0]
-        best_nf = best_row["nf"]
-
-        st.markdown("##### 🧮 Opções de NF para o vão")
-        st.dataframe(
-            df_vao_sorted.rename(
-                columns={
-                    "nf": "NF",
-                    "kw": "kW interrompidos",
-                    "n_barras": "Nº barras isoladas",
-                }
-            ),
-            use_container_width=True,
-        )
-
-        # =================================================
-        # MAPA COM DESTAQUE DO VÃO E DA NF
-        # =================================================
-        fig_vao = build_figure(
-            G,
-            coords,
-            vao=(u, v),
-            best_nf=best_nf,
-        )
-        st.plotly_chart(fig_vao, use_container_width=True)
-
-        # =================================================
-        # LINHA DO TEMPO DA MANOBRA
-        # =================================================
-        st.markdown("### 📜 Linha do tempo da manobra")
-
-        st.markdown(
-            f"""
 1. **Identificação do vão de trabalho**  
    - Trecho entre as barras **{u}** e **{v}**.
 
