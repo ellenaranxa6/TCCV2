@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import sqlite3
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
+import ast  # <-- para interpretar a lista de barras da tabela nf_map
 
 
 # =========================================================
@@ -96,7 +97,7 @@ def carregar_vao_map():
 
 @st.cache_data(show_spinner=False)
 def carregar_loads():
-    """Tabela loads(bus, kw) – para uso futuro se quiser detalhar cargas."""
+    """Tabela loads(bus, kw)."""
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -106,6 +107,49 @@ def carregar_loads():
         rows = []
     conn.close()
     return {str(b): float(kw) for b, kw in rows}
+
+
+@st.cache_data(show_spinner=False)
+def carregar_nf_map():
+    """
+    Tabela nf_map(nf, barras_isoladas TEXT, kw REAL, n_barras INTEGER).
+
+    barras_isoladas está salva como uma string de lista Python,
+    ex.: '["33", "61", "18", ...]'.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT nf, barras_isoladas, kw, n_barras FROM nf_map"
+        )
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+
+    nf_dict: Dict[str, Dict] = {}
+    for nf, barras_str, kw, n in rows:
+        barras_set = set()
+        if barras_str:
+            try:
+                lista = ast.literal_eval(barras_str)
+                for b in lista:
+                    barras_set.add(str(b).strip())
+            except Exception:
+                # fallback burro: separa por vírgula
+                for b in str(barras_str).replace("[", "").replace("]", "").replace('"', "").split(","):
+                    b = b.strip()
+                    if b:
+                        barras_set.add(b)
+
+        nf_dict[str(nf)] = {
+            "barras": barras_set,
+            "kw": float(kw),
+            "n_barras": int(n),
+        }
+
+    return nf_dict
 
 
 def listar_tabelas() -> List[str]:
@@ -167,6 +211,33 @@ def obter_barras_unicas(vaos: List[Tuple[str, str]]) -> List[str]:
         s.add(u)
         s.add(v)
     return sorted(s, key=lambda x: (x.isdigit(), int(x) if x.isdigit() else x))
+
+
+def impacto_consolidado(lista_nf: List[str],
+                        loads: Dict[str, float],
+                        nf_map_data: Dict[str, Dict]) -> Tuple[float, int, List[str]]:
+    """
+    Calcula o impacto consolidado de uma manobra que envolve
+    várias NFs, **sem dupla contagem** de carga:
+
+      - união das barras isoladas por todas as NFs;
+      - soma dos kW por barra (usando tabela loads).
+
+    Retorna: (kW_total, n_barras_unicas, lista_barras_ordenada)
+    """
+    barras_afetadas = set()
+    for nf in lista_nf:
+        reg = nf_map_data.get(nf)
+        if not reg:
+            continue
+        barras_afetadas |= reg["barras"]
+
+    kw_total = sum(loads.get(b, 0.0) for b in barras_afetadas)
+    barras_ordenadas = sorted(
+        barras_afetadas,
+        key=lambda x: (x.isdigit(), int(x) if x.isdigit() else x)
+    )
+    return kw_total, len(barras_afetadas), barras_ordenadas
 
 
 # =========================================================
@@ -272,7 +343,6 @@ def plotar_mapa_com_trecho(
     nf_labels_y = []
     nf_labels_text = []
 
-    # cria lookup de topologia por linha
     topo_por_line = {el["line"]: el for el in topo}
 
     for info in info_vaos:
@@ -286,7 +356,6 @@ def plotar_mapa_com_trecho(
                 x1, y1 = coords[v]
                 nf_edges_x += [x0, x1, None]
                 nf_edges_y += [y0, y1, None]
-                # ponto médio para label
                 nf_labels_x.append((x0 + x1) / 2)
                 nf_labels_y.append((y0 + y1) / 2)
                 nf_labels_text.append(nf)
@@ -330,14 +399,17 @@ if not DB_PATH.exists():
 
 tabelas = listar_tabelas()
 st.sidebar.write("Banco:", f"`{DB_PATH.name}`")
-st.sidebar.write("MASTER:", "✅" if "topology" in tabelas else "❌")
+st.sidebar.write("TOPOLOGY:", "✅" if "topology" in tabelas else "❌")
 st.sidebar.write("COORDS:", "✅" if "coords" in tabelas else "❌")
+st.sidebar.write("LOADS:", "✅" if "loads" in tabelas else "❌")
 st.sidebar.write("VAO_MAP:", "✅" if "vao_map" in tabelas else "❌")
+st.sidebar.write("NF_MAP:", "✅" if "nf_map" in tabelas else "❌")
 
 coords = carregar_coords()
 topo = carregar_topologia()
 vao_map = carregar_vao_map()
 loads = carregar_loads()
+nf_map_data = carregar_nf_map()
 
 if not coords or not topo or not vao_map:
     st.error("Banco encontrado, mas alguma tabela essencial está vazia.")
@@ -359,7 +431,7 @@ em um banco **SQLite** (`ieee123_isolamento.db`).
 Este aplicativo usa **apenas** o banco + coordenadas de barras para exibir:
 
 - ✅ Melhor chave **NF** de manobra para cada vão U-V  
-- ⚡ Carga interrompida e número de barras isoladas  
+- ⚡ Carga interrompida e número de barras isoladas (por NF e consolidado)  
 - 🗺️ Mapa colorido da rede com destaque do vão e da NF  
 - 📜 “Linha do tempo” simplificada da manobra  
 """
@@ -379,11 +451,10 @@ st.markdown("---")
 
 
 # =========================================================
-# INTERFACE – SELEÇÃO DE VÃO SIMPLES
+# INTERFACE – VÃO SIMPLES
 # =========================================================
 st.sidebar.subheader("🔧 Vão simples (U-V)")
 
-# lista de barras disponível
 lista_barras = sorted(
     coords.keys(),
     key=lambda x: (x.isdigit(), int(x) if x.isdigit() else x),
@@ -403,7 +474,7 @@ if st.sidebar.button("Confirmar vão simples"):
     else:
         st.success(
             f"**Melhor NF:** `{info['nf']}`  |  "
-            f"**Carga interrompida:** {info['kw']:.1f} kW  |  "
+            f"**Carga interrompida (NF isolada):** {info['kw']:.1f} kW  |  "
             f"**Barras isoladas:** {info['n_barras']}"
         )
 
@@ -435,7 +506,6 @@ entrada_seq = st.text_input(
 )
 
 if st.button("Processar Trecho (Multi-Vãos)"):
-    # Parse da entrada
     barras_raw = [b.strip() for b in entrada_seq.split(",") if b.strip()]
     if len(barras_raw) < 2:
         st.error("Informe pelo menos duas barras.")
@@ -473,14 +543,14 @@ if st.button("Processar Trecho (Multi-Vãos)"):
                 )
 
             if info_vaos:
-                st.markdown("### ✅ NF de manobra por vão")
+                st.markdown("### ✅ NF de manobra por vão (impacto individual)")
 
                 df_data = [
                     {
                         "Vão (U-V)": f"{d['u']} - {d['v']}",
                         "NF ótima": d["nf"],
-                        "kW interrompidos": d["kw"],
-                        "Barras isoladas": d["n_barras"],
+                        "kW interrompidos (NF isolada)": d["kw"],
+                        "Barras isoladas (NF isolada)": d["n_barras"],
                     }
                     for d in info_vaos
                 ]
@@ -496,13 +566,35 @@ if st.button("Processar Trecho (Multi-Vãos)"):
                 st.markdown("### 🗺️ Mapa com trecho e NFs destacadas")
                 st.plotly_chart(fig_multi, use_container_width=True)
 
-                # linha do tempo de manobra
-                st.markdown("### 📜 Linha de tempo de manobra (sequência sugerida)")
+                # ------- IMPACTO CONSOLIDADO (SEM DUPLA CONTAGEM) -------
+                st.markdown("### ⚡ Impacto consolidado da manobra (sem dupla contagem)")
 
-                lista_nf_ordenada = []
+                # NFs na ordem de abertura (sem repetir)
+                lista_nf_ordenada: List[str] = []
                 for d in info_vaos:
                     if d["nf"] not in lista_nf_ordenada:
                         lista_nf_ordenada.append(d["nf"])
+
+                kw_total, n_barras_unicas, barras_ordenadas = impacto_consolidado(
+                    lista_nf_ordenada, loads, nf_map_data
+                )
+
+                if not nf_map_data:
+                    st.warning(
+                        "Tabela `nf_map` não está disponível no banco. "
+                        "Não foi possível calcular o impacto consolidado."
+                    )
+                else:
+                    st.success(
+                        f"**Carga total interrompida:** {kw_total:.1f} kW  \n"
+                        f"**Barras desenergizadas únicas:** {n_barras_unicas}"
+                    )
+
+                    with st.expander("Ver barras desenergizadas únicas"):
+                        st.write(barras_ordenadas)
+
+                # ------- Linha de tempo da manobra -------
+                st.markdown("### 📜 Linha de tempo de manobra (sequência sugerida)")
 
                 for i, nf in enumerate(lista_nf_ordenada, start=1):
                     vaos_nf = [
